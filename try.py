@@ -5,12 +5,17 @@ import time
 import os
 
 # --- CARGAR MODELO DE IA ---
-try:
-    model = tf.keras.models.load_model('modelo_ojos_64.h5')
-    print("Modelo IA cargado correctamente.")
-except:
-    print("ADVERTENCIA: No se encontró 'modelo_ojos_64.h5'. Modo simulación.")
-    model = None
+model = None
+for modelo_path in ['karmi1.1M_64.h5', 'modelo_ojos_64.h5', 'karmi64.h5']:
+    try:
+        model = tf.keras.models.load_model(modelo_path)
+        print(f"✅ Modelo '{modelo_path}' cargado correctamente.")
+        break
+    except:
+        continue
+
+if model is None:
+    print("❌ ERROR: No se encontró ningún modelo .h5 compatible.")
 
 # --- CARGAR CASCADAS (Detectores) ---
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
@@ -38,7 +43,13 @@ cv2.createTrackbar('Umbral IA %', nombre_ventana, 60, 100, nada)
 cv2.createTrackbar('Padding Ojo %', nombre_ventana, 20, 100, nada)
 
 memoria_ojos = {"izq": None, "der": None}
-cap = cv2.VideoCapture(1) 
+memoria_relativa = {"izq": None, "der": None} # dx, dy respecto al centro de la CARA
+face_smooth = None # Para suavizado de cara
+cap = cv2.VideoCapture(0) 
+
+def ema_smoothing(viejo, nuevo, alpha=0.3):
+    if viejo is None: return nuevo
+    return tuple(int(alpha * n + (1-alpha) * v) for v, n in zip(viejo, nuevo))
 
 ultimo_tiempo_medicion = time.time()
 intervalo_medicion = 1.0 
@@ -49,13 +60,18 @@ estado_actual = {
 }
 
 def procesar_para_ia(roi):
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    gray_clahe = clahe.apply(gray)
-    img_resized = cv2.resize(gray_clahe, (64, 64)) 
-    img_norm = img_resized.astype('float32') / 255.0
-    img_3ch = cv2.merge([img_norm, img_norm, img_norm])
-    return img_resized, np.expand_dims(img_3ch, axis=0)
+    """Sincronizado al 100% con el entrenamiento (RGB + Contraste)"""
+    # 1. Redimensión a 64x64
+    img = cv2.resize(roi, (64, 64))
+    # 2. BGR a RGB (Fundamental)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    # 3. Mejora de contraste (idéntica al entrenamiento: 1.2, -30)
+    img_cont = cv2.addWeighted(img_rgb, 1.2, np.zeros(img_rgb.shape, img_rgb.dtype), 0, -30)
+    # 4. Normalización [0, 1]
+    img_norm = img_cont.astype('float32') / 255.0
+    # 5. Formato Tensor
+    tensor = np.expand_dims(img_norm, axis=0)
+    return img_cont, tensor
 
 while True:
     tiempo_actual = time.time()
@@ -73,7 +89,19 @@ while True:
     h_frame, w_frame, _ = frame.shape
     
     gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray_frame, 1.1, 5)
+    
+    # --- FILTRO: SOLO UN ROSTRO (el más grande) ---
+    faces = face_cascade.detectMultiScale(gray_frame, 1.1, 5, minSize=(100, 100))
+    if len(faces) > 0:
+        face_principal = max(faces, key=lambda rect: rect[2] * rect[3])
+        # Suavizado de cara
+        face_smooth = ema_smoothing(face_smooth, face_principal, 0.4)
+        faces = [face_smooth]
+    else:
+        # Resetear memorias si no hay cara
+        memoria_ojos = {"izq": None, "der": None}
+        memoria_relativa = {"izq": None, "der": None}
+        face_smooth = None
 
     ojos_visualizables = [] 
 
@@ -115,27 +143,57 @@ while True:
                     cv2.rectangle(frame, (x+nx_loc, y+ny_real_en_cara), 
                                   (x+nx_loc+nw_loc, y+ny_real_en_cara+nh_loc), (0, 255, 0), 1)
 
-        # --- CÁLCULO DE LÍMITES ---
-        if nariz_detectada:
-            # ANATOMÍA: Ojos encima de la nariz
-            y_limite_inferior = y + ny_real_en_cara + int(nh_local * 0.2) 
-            distancia = int(nh_local * 1.5)
-            y_limite_superior = max(y, y_limite_inferior - distancia)
-            cv2.line(frame, (x, y_limite_inferior), (x+w, y_limite_inferior), (255, 0, 0), 2) # Azul = Preciso
-        else:
-            # FALLBACK: Estimación
-            cv2.line(frame, (x, y_limite_inferior), (x+w, y_limite_inferior), (0, 255, 255), 1) # Amarillo = Estimado
+        # --- CÁLCULO DE LÍMITES (Fijos por la CARA para mayor estabilidad) ---
+        y_limite_superior = int(y + (h * 0.18))
+        y_limite_inferior = int(y + (h * 0.52))
+        
+        # Dibujar línea verde de referencia (basada en la cara)
+        cv2.line(frame, (x, y_limite_inferior), (x+w, y_limite_inferior), (0, 255, 0), 2)
 
         # Validar y Extraer
         if y_limite_inferior > y_limite_superior:
             roi_franja = gray_frame[y_limite_superior:y_limite_inferior, x:x+w]
             if roi_franja.size > 0:
-                eyes = eye_cascade.detectMultiScale(roi_franja, 1.1, 8, minSize=(20, 20))
+                eyes = eye_cascade.detectMultiScale(roi_franja, 1.1, 6, minSize=(18, 18))
                 
+                # --- FILTRO: EXACTAMENTE DOS OJOS (mejor par) ---
                 if len(eyes) >= 2:
-                    eyes = sorted(eyes, key=lambda e: e[0])
-                    memoria_ojos["izq"] = eyes[0]
-                    memoria_ojos["der"] = eyes[1]
+                    eyes_s = sorted(eyes, key=lambda e: e[0])
+                    mejor_par = None
+                    max_sep = 0
+                    for i in range(len(eyes_s)):
+                        for j in range(i+1, len(eyes_s)):
+                            cx_i = eyes_s[i][0] + eyes_s[i][2]//2
+                            cx_j = eyes_s[j][0] + eyes_s[j][2]//2
+                            sep = cx_j - cx_i
+                            # Anatomía: ojos separados entre 15% y 75% del ancho de la cara
+                            if w * 0.15 < sep < w * 0.75:
+                                if sep > max_sep:
+                                    max_sep = sep
+                                    mejor_par = (eyes_s[i], eyes_s[j])
+                    
+                    if mejor_par:
+                        # Si detectamos ojos, guardamos su posición relativa al ROSTRO
+                        memoria_ojos["izq"] = ema_smoothing(memoria_ojos["izq"], mejor_par[0])
+                        memoria_ojos["der"] = ema_smoothing(memoria_ojos["der"], mejor_par[1])
+                        
+                        # Guardar anclaje respecto al centro de la cara (regido por la cara/línea verde)
+                        cx_f, cy_f = x + w//2, y + h//2
+                        for lado in ["izq", "der"]:
+                            ex, ey, ew, eh = memoria_ojos[lado]
+                            abs_x, abs_y = x + ex, y_limite_superior + ey
+                            memoria_relativa[lado] = (abs_x - cx_f, abs_y - cy_f, ew, eh)
+                
+                # --- FALLBACK: FIJAR POR EL ROSTRO SI SE PIERDEN ---
+                elif memoria_relativa["izq"] is not None:
+                    # Usar el centro de la cara actual como ancla (altura por la cara)
+                    cx_f, cy_f = x + w//2, y + h//2
+                    for lado in ["izq", "der"]:
+                        dx, dy, ew, eh = memoria_relativa[lado]
+                        # Re-construir posición del ojo basada en la cara actual
+                        abs_x, abs_y = cx_f + dx, cy_f + dy
+                        # Actualizar memoria_ojos (relativo a la franja actual)
+                        memoria_ojos[lado] = (abs_x - x, abs_y - y_limite_superior, ew, eh)
                 
                 posiciones = []
                 if memoria_ojos["izq"] is not None and memoria_ojos["der"] is not None:
@@ -169,7 +227,8 @@ while True:
                         cv2.rectangle(frame, (nx, ny), (nx+nw_f, ny+nh_f), info["color"], 2)
                         
                         # Display
-                        disp = cv2.cvtColor(img_vis, cv2.COLOR_GRAY2BGR)
+                        # Convertimos de vuelta a BGR solo para que cv2.imshow lo muestre bien
+                        disp = cv2.cvtColor(img_vis, cv2.COLOR_RGB2BGR)
                         disp = cv2.resize(disp, (100, 100), interpolation=cv2.INTER_NEAREST)
                         cv2.putText(disp, info["estado"], (5, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.4, info["color"], 1)
                         ojos_visualizables.append(disp)
