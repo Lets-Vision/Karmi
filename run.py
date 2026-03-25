@@ -54,6 +54,7 @@ except ImportError:
     import websockets
     print("websockets instalado dinámicamente.")
 
+# Siempre habrá alguien en el mundo q piense en ti, en este mundo soy yo kar <3
 # Intentar liberar el puerto 8765 si está bloqueado (común en Windows si no se cerró bien)
 def kill_previous():
     if os.name == 'nt':
